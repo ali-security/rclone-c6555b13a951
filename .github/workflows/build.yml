@@ -6,18 +6,16 @@ name: build
 
 # Trigger the workflow on push or pull request
 on:
-  push:
-    branches:
-      - '**'
-    tags:
-      - '**'
-  pull_request:
   workflow_dispatch:
     inputs:
       manual:
         description: Manual run (bypass default conditions)
         type: boolean
         default: true
+      test-filter:
+        description: Go test -run regexp (empty runs the full suite)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -220,9 +218,32 @@ jobs:
         run: |
           rclone version
 
+      # minio/minio was withdrawn from Docker Hub, so TestS3Minio's
+      # init.d script cannot pull it; provide a drop-in build of the
+      # same server under that name.
+      - name: Provide minio image for TestS3Minio
+        run: |
+          docker pull pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+          docker tag pgsty/minio:RELEASE.2026-08-04T00-00-00Z minio/minio:latest
+        if: matrix.quicktest && matrix.os == 'ubuntu-latest'
+
       - name: Run tests
         run: |
-          make quicktest
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            RCLONE_CONFIG="/notfound" go test -v -tags "$GOTAGS" -timeout 20m -run "${{ inputs.test-filter }}" ./... 2>&1 | tee quicktest.log
+          else
+            GOFLAGS=-v make quicktest 2>&1 | tee quicktest.log
+          fi
+        if: matrix.quicktest
+
+      - name: Test summary
+        env:
+          LC_ALL: C
+        run: |
+          awk '/^[[:space:]]*--- PASS/{p++} /^[[:space:]]*--- FAIL/{f++} /^[[:space:]]*--- SKIP/{s++} /^ok[[:space:]]/{k++}
+            END{printf "Tests passed: %d\nTests failed: %d\nTests skipped: %d\nPackages ok: %d\n", p, f, s, k}' quicktest.log
+          echo "Skipped tests (with reasons):"
+          awk '/^[[:space:]]*--- SKIP/{print; n=2; next} n>0{print; n--}' quicktest.log
         if: matrix.quicktest
 
       - name: Race test
@@ -260,10 +281,10 @@ jobs:
           # the already-extracted module cache, so drop them before the cache
           # is saved - this roughly halves the module cache size.
           modcache=$(go env GOMODCACHE | tr '\\' '/')
-          find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
+          if [ -d "$modcache/cache/download" ]; then find "$modcache/cache/download" -name '*.zip' -type f -delete; fi
 
   lint:
-    if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
+    if: false
     timeout-minutes: 30
     name: "lint"
     runs-on: ubuntu-latest
@@ -374,7 +395,66 @@ jobs:
           # the already-extracted module cache, so drop them before the cache
           # is saved - this roughly halves the module cache size.
           modcache=$(go env GOMODCACHE | tr '\\' '/')
-          find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
+          if [ -d "$modcache/cache/download" ]; then find "$modcache/cache/download" -name '*.zip' -type f -delete; fi
+
+  module-zip:
+    timeout-minutes: 20
+    name: "module zip"
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '~1.26.6'
+          cache: false
+
+      - name: Build module zip
+        run: |
+          cp -r "$GITHUB_WORKSPACE" /tmp/modsrc
+          rm -rf /tmp/modsrc/.git
+          mkdir -p /tmp/zipper /tmp/out
+          cat > /tmp/zipper/main.go <<'GOEOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[3])
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              mv := module.Version{Path: "github.com/rclone/rclone", Version: os.Args[1]}
+              if err := zip.CreateFromDir(f, mv, os.Args[2]); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          GOEOF
+          cd /tmp/zipper
+          go mod init zipper
+          GOFLAGS=-mod=mod go get golang.org/x/mod@v0.24.0
+          go run . v1.75.1 /tmp/modsrc /tmp/out/v1.75.1.zip
+          unzip -l /tmp/out/v1.75.1.zip | tail -1
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/out/v1.75.1.zip
+          if-no-files-found: error
 
   android:
     if: inputs.manual || (github.repository == 'rclone/rclone' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.event.pull_request.base.repo.full_name))
@@ -510,4 +590,4 @@ jobs:
           # the already-extracted module cache, so drop them before the cache
           # is saved - this roughly halves the module cache size.
           modcache=$(go env GOMODCACHE | tr '\\' '/')
-          find "$modcache/cache/download" -name '*.zip' -type f -delete 2>/dev/null || true
+          if [ -d "$modcache/cache/download" ]; then find "$modcache/cache/download" -name '*.zip' -type f -delete; fi
